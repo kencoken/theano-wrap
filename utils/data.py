@@ -1,3 +1,7 @@
+import numpy as np
+import theano
+import pandas as pd
+
 import os
 import skimage.io
 import skimage.color
@@ -9,6 +13,9 @@ import h5py
 from multiprocessing import Process, Queue
 #import threading
 #from Queue import Queue
+
+import logging
+log = logging.getLogger('data')
 
 class BatchLoader(object):
 
@@ -34,10 +41,16 @@ class BatchLoader(object):
 
         #         self.images.append((parts[0], parts[1]))
 
+        print input_file
         self.df = pd.read_csv(input_file, sep=',',
                               names=['label'])
 
-    def batch_gen(self, sz, shuffle=False):
+        self.num_classes = pd.unique(self.df['label']).size
+
+    def batch_gen(self, sz, shuffle=False, async=False):
+
+        # define number of batches to pre-load when using async mode
+        async_num_cached = 50
 
         batch_count = int(math.ceil(len(self.df) / float(sz)))
 
@@ -52,15 +65,17 @@ class BatchLoader(object):
 
         x_shape = (sz, ch_count, self.imshape[0], self.imshape[1])
         y_shape = (sz,)
-        x_chunk = np.zeros(x_shape, dtype=theano.config.floatX)
-        y_chunk = np.zeros(y_shape, dtype=np.int32)
 
-        for batch_num in range(batch_count):
+        # batch generation function
+
+        def produce_batch(batch_num):
             batch_start = batch_num*sz
             batch_end = batch_start + sz
             if batch_end > len(self.df):
                 batch_end = len(self.df)
 
+            x_chunk = np.zeros(x_shape, dtype=theano.config.floatX)
+            y_chunk = np.zeros(y_shape, dtype=np.int32)
             paths = []
 
             for batch_i in range(batch_start, batch_end):
@@ -80,73 +95,39 @@ class BatchLoader(object):
                 #y_chunk[batch_i] = label
                 #paths.append(impath)
 
-            yield x_chunk, y_chunk, paths
+            return x_chunk, y_chunk, paths
 
-    def batch_gen_async(self, sz, shuffle=False):
+        # produce batches, either synchronously or asynchronously
 
-        batch_count = int(math.ceil(len(self.df) / float(sz)))
-        num_cached = 50 # cache 5 batches (so load next while processing previous)
+        if not async:
 
-        idxs = range(len(self.df))
-        if shuffle:
-            idxs = list(np.random.permutation(idxs))
-
-        if self.greyscale:
-            ch_count = 1
-        else:
-            ch_count = 3
-
-        x_shape = (sz, ch_count, self.imshape[0], self.imshape[1])
-        y_shape = (sz,)
-
-        queue = Queue(maxsize=num_cached)
-        end_marker = object()
-
-        # define producer
-        def producer():
             for batch_num in range(batch_count):
-                batch_start = batch_num*sz
-                batch_end = batch_start + sz
-                if batch_end > len(self.df):
-                    batch_end = len(self.df)
+                yield produce_batch(batch_num)
 
-                x_chunk = np.zeros(x_shape, dtype=theano.config.floatX)
-                y_chunk = np.zeros(y_shape, dtype=np.int32)
-                paths = []
+        else:
 
-                for batch_i in range(batch_start, batch_end):
-                    image_ifo = self.df.iloc[idxs[batch_i]]
+            # initialize job queue
+            queue = Queue(maxsize=async_num_cached)
+            end_marker = 'end'
 
-                    im = self.load_image(os.path.join(self.input_dir,
-                                                 image_ifo.name))
-                    x_chunk[batch_i - batch_start] = im
-                    y_chunk[batch_i - batch_start] = image_ifo['label']
-                    paths.append(image_ifo.name)
-                    #impath, label = self.images[batch_i]
-                    #
-                    #x_chunk[batch_i] = self.load_image(impath)
-                    #y_chunk[batch_i] = label
-                    #paths.append(impath)
+            def producer():
 
-                log.info('putting in queue with %d items' % queue.qsize())
-                queue.put((x_chunk, y_chunk, paths))
-                log.info('put new item...')
-                #queue.put((x_chunk, one_hot(y_chunk).eval(), paths))
+                for batch_num in range(batch_count):
+                    x_chunk, y_chunk, paths = produce_batch(batch_num)
+                    queue.put((x_chunk, y_chunk, paths))
 
-            queue.put(end_marker)
+                queue.put(end_marker)
 
-        # start producer
-        #thread = threading.Thread(target=producer)
-        proc = Process(target=producer)
-        proc.daemon = True
-        proc.start()
+            # start producer
+            proc = Process(target=producer)
+            proc.daemon = True
+            proc.start()
 
-        # run as consumer
-        item = queue.get()
-        while item is not end_marker:
-            yield item
-            #queue.task_done()
+            # run as consumer
             item = queue.get()
+            while item != end_marker:
+                yield item
+                item = queue.get()
 
     def load_image(self, impath, normalize=False):
 
@@ -173,6 +154,8 @@ class BatchLoader(object):
                 im = skimage.color.rgb2grey(im)
 
         return im
+
+##
 
 class ChunkBatchLoader(object):
 
@@ -201,7 +184,12 @@ class ChunkBatchLoader(object):
 
                 self.chunk_paths.append(line)
 
-    def batch_gen(self, sz, shuffle=False):
+    def batch_gen(self, sz, shuffle=False, async=False):
+
+        if async:
+            # async chunk loading not implemented, as probably wouldn't speed things up
+            # appreciably at all
+            log.warning('async batch loading not implemented for chunks - ignoring async flag')
 
         #batch_count = int(math.ceil(self.dset_sz / float(sz)))
         if self.chunk_sz % sz != 0:
@@ -240,94 +228,5 @@ class ChunkBatchLoader(object):
                 if chunk_end:
                     break
 
-    # def batch_gen_async(self, sz, shuffle=False):
-
-    #     batch_count = int(math.ceil(len(self.df) / float(sz)))
-    #     num_cached = 50 # cache 5 batches (so load next while processing previous)
-
-    #     idxs = range(len(self.df))
-    #     if shuffle:
-    #         idxs = list(np.random.permutation(idxs))
-
-    #     if self.greyscale:
-    #         ch_count = 1
-    #     else:
-    #         ch_count = 3
-
-    #     x_shape = (sz, ch_count, self.imshape[0], self.imshape[1])
-    #     y_shape = (sz,)
-
-    #     queue = Queue(maxsize=num_cached)
-    #     end_marker = object()
-
-    #     # define producer
-    #     def producer():
-    #         for batch_num in range(batch_count):
-    #             batch_start = batch_num*sz
-    #             batch_end = batch_start + sz
-    #             if batch_end > len(self.df):
-    #                 batch_end = len(self.df)
-
-    #             x_chunk = np.zeros(x_shape, dtype=theano.config.floatX)
-    #             y_chunk = np.zeros(y_shape, dtype=np.int32)
-    #             paths = []
-
-    #             for batch_i in range(batch_start, batch_end):
-    #                 image_ifo = self.df.iloc[idxs[batch_i]]
-
-    #                 im = self.load_image(os.path.join(self.input_dir,
-    #                                              image_ifo.name))
-    #                 x_chunk[batch_i - batch_start] = im
-    #                 y_chunk[batch_i - batch_start] = image_ifo['label']
-    #                 paths.append(image_ifo.name)
-    #                 #impath, label = self.images[batch_i]
-    #                 #
-    #                 #x_chunk[batch_i] = self.load_image(impath)
-    #                 #y_chunk[batch_i] = label
-    #                 #paths.append(impath)
-
-    #             log.info('putting in queue with %d items' % queue.qsize())
-    #             queue.put((x_chunk, y_chunk, paths))
-    #             log.info('put new item...')
-    #             #queue.put((x_chunk, one_hot(y_chunk).eval(), paths))
-
-    #         queue.put(end_marker)
-
-    #     # start producer
-    #     #thread = threading.Thread(target=producer)
-    #     proc = Process(target=producer)
-    #     proc.daemon = True
-    #     proc.start()
-
-    #     # run as consumer
-    #     item = queue.get()
-    #     while item is not end_marker:
-    #         yield item
-    #         #queue.task_done()
-    #         item = queue.get()
-
-    # def load_image(self, impath, normalize=False):
-
-    #     if os.path.splitext(impath)[1] == '.npz':
-    #         im = np.load(impath)['im']
-
-    #     else:
-
-    #         im = skimage.io.imread(impath)
-    #         if normalize:
-    #             im = im / 255.0
-
-    #         im = resize(im, self.imshape, mode='nearest')
-
-    #     if self.mean_im is not None:
-    #         im -= self.mean_im
-
-    #     # shuffle from (W,H,3) to (3,W,H)
-    #     if not self.greyscale:
-    #         im = np.swapaxes(im,0,2)
-    #         im = np.swapaxes(im,1,2)
-    #     else:
-    #         if im.ndim == 3:
-    #             im = skimage.color.rgb2grey(im)
-
-    #     return im
+    def batch_gen_async(self, sz, shuffle=False):
+        raise RuntimeError('Not implemented!')
